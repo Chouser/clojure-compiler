@@ -17,7 +17,7 @@
                          Compiler$CompilerException
                          IPersistentList IPersistentVector
                          IPersistentMap IPersistentSet)
-           (java.lang.reflect Modifier))
+           (java.lang.reflect Modifier Method Field))
   (:use [clojure.contrib.cond :only (cond-let)]))
 
 (defn old-analyze [f]
@@ -158,7 +158,7 @@
 (def *emit-context* :expression) ; could also be :statement, :return, or :eval
 (def *reflector*
   {:get-field #(clojure.lang.Reflector/getField %1 %2 %3)
-   :get-methods #(seq (clojure.lang.Reflector/getMethods %1 %2 %3 %4))
+   :get-methods #(clojure.lang.Reflector/getMethods %1 %2 %3 %4)
    :arg-type-match #(clojure.lang.Reflector/paramArgTypeMatch %1 %2)})
 
 (defn eval-or [x]
@@ -576,17 +576,15 @@
                           cs1 cs2))))
 
 
-(defn get-matching-params [mname target-expr arg-exprs methods rets]
+(defn get-matching-params [mname target-expr arg-exprs minfos]
+  ; cons target-expr type onto aclasses and :params:
   (let [jclass #(if (ast-has-java-class %) (ast-get-java-class %) Object)
-        ; include target-expr type in aclasses and :params
         aclasses (map jclass (cons target-expr arg-exprs))
-        minfos (map (fn [m r] {:method m :rtn r
-                               :params (cons (.getDeclaringClass m)
-                                             (.getParameterTypes m))})
-                    methods rets)
         match? (:arg-type-match *reflector*)
+        either-match?  #(or (match? %1 %2) (match? %2 %1))
         matching-minfos (filter #(every? identity
-                                          (map match? aclasses (:params %)))
+                                          (map either-match?
+                                               (:params %) aclasses))
                                  minfos)]
     ; Now eliminate all methods that are subsumed by some other
     ; matching method, returning just the minimal set
@@ -594,76 +592,45 @@
     ;(prn :arg aclasses)
     ;(println "----")
     ;(doseq [m matching-minfos] (prn (:params m)))
-    (set (map :method
+    (set (map :member
               (remove (fn [x]
                         (some
                           #(and (not= % x) (subsumes (:params x) (:params %)))
                           matching-minfos))
                       matching-minfos)))))
 
-; If the target type + param types are equal, java already prommises
-; that the return type will be assignable, so there's no need to
-; check.
-; (or (subsumes (:params x) (:params %))
-;     (and (= (:params %) (:params x))
-;          (.isAssignableFrom (:rtn %) (:rtn x))))
-
-
-;(get-matching-params mname members args (repeat c))
-;(get-matching-params mname members args (map #(.getReturnType %) c))
-
-(defn instance-method [form source line obj mname args]
-  ;(prn args)
-  (let [methods (mapcat #((:get-methods *reflector*) % (count args) mname false)
-                        (if (ast-has-java-class obj)
-                          ;[(ast-get-java-class obj)]
-                          (vals (ns-imports *ns*))
-                          (vals (ns-imports *ns*))))
-        rets (map #(.getReturnType %) methods)]
-  {:type :instance-method
-   :methods (get-matching-params mname obj args methods rets)}))
-
-;; {:form form :obj obj :mname mname :args args :type :instance-method})
-
-
+(defn instance-member [form source line obj mname args & [allow-field]]
+  (let [minfos (for [c (vals (ns-imports *ns*))
+                     m ((:get-methods *reflector*) c (count args) mname false)]
+                 {:member m, :params (cons c (.getParameterTypes m))})
+        finfos (when (and (empty? args) allow-field)
+                 (for [c (vals (ns-imports *ns*))
+                       :let [m ((:get-field *reflector*) c mname false)]
+                       :when m]
+                   {:member m :params [c]}))
+        members (get-matching-params mname obj args (concat minfos finfos))
+        this-type-known (ast-has-java-class obj)]
+    (when (and *warn-on-reflection*
+               (or (not this-type-known) (> (count members) 1)))
+      (.write *err*
+        (format "Reflection warning line: %d - call to %s%s, %d matches found"
+                line mname (if this-type-known "" " with untyped 'this'")
+                (count members))))
+    (ast :instance-member form (when this-type-known
+                                 (let [m (first members)]
+                                   (cond (not m) nil
+                                         (instance? Field m) #(.getType m)
+                                         :else #(.getReturnType m))))
+     :this-type-known this-type-known
+     :allow-field (if this-type-known
+                    (instance? Field (first members))
+                    (boolean allow-field))
+     :members members)))
 
 (defn static-method   [form source line cls mname args]
   {:form form :cls cls :mname mname :args args :type :static-method})
-(defn instance-field  [form source line obj fname]
-  {:form form :obj obj :fname fname :type :instance-field})
 (defn static-field    [form source line cls fname]
   {:form form :cls cls :fname fname :type :static-field})
-
-;              (let [field (.getField cls fld-meth-name)]
-;                (ast :static-field form (constantly (.getType field))
-;                     :line *line*)))
-
-;(defmethod analyze-seq '. [[_ class-or-inst fld-meth-lst :as form]]
-;  (when (< (count form) 3)
-;    (err-arg "Malformed member expression, expecting (. target member ...)"))
-;  (let [cls (maybe-class class-or-inst false)
-;        obj (when-not cls
-;              (binding [*emit-context* (eval-or :expression)]
-;                (analyze class-or-inst)))] ; instance, in this case
-;    (if (and (== (count form) 3) (symbol? fld-meth-lst))
-;      (let [fld-meth-name (name fld-meth-lst)]
-;        (if cls
-;          (if ((:get-methods *reflector*) cls 0 fld-meth-name true)
-;            (static-method form *source* *line* cls fld-meth-name [])
-;            (static-field form *source* *line* cls fld-meth-name))
-;          (if (and obj (ast-has-java-class obj) (ast-get-java-class obj)
-;                   ((:get-methods *reflector*)
-;                       (ast-get-java-class obj) 0 fld-meth-name false))
-;            (instance-method form *source* *line* obj fld-meth-name [])
-;            (instance-field form *source* *line* obj fld-meth-name))))
-;      (let [[sym & arg-seq] (if (seq? fld-meth-lst) fld-meth-lst (nnext form))
-;            args (binding [*emit-context* (eval-or :expression)]
-;                   (into [] (map analyze arg-seq)))]
-;        (when-not (symbol? sym)
-;          (err-arg "Malformed member expression"))
-;        (if cls
-;          (static-method form *source* *line* cls (name sym) args)
-;          (instance-method form *source* *line* obj (name sym) args))))))
 
 (defmethod analyze-seq '. [[_ class-or-inst fld-meth-lst :as form]]
   (when (< (count form) 3)
@@ -675,11 +642,10 @@
     (if (and (== (count form) 3) (symbol? fld-meth-lst))
       (let [fld-meth-name (name fld-meth-lst)]
         (if cls
-          (if ((:get-methods *reflector*) cls 0 fld-meth-name true)
+          (if (seq ((:get-methods *reflector*) cls 0 fld-meth-name true))
             (static-method form *source* *line* cls fld-meth-name [])
             (static-field form *source* *line* cls fld-meth-name))
-          (instance-method form *source* *line* obj fld-meth-name [])))
-          ; previously, instance-field 
+          (instance-member form *source* *line* obj fld-meth-name [] :fld-ok)))
       (let [[sym & arg-seq] (if (seq? fld-meth-lst) fld-meth-lst (nnext form))
             args (binding [*emit-context* (eval-or :expression)]
                    (into [] (map analyze arg-seq)))]
@@ -687,6 +653,6 @@
           (err-arg "Malformed member expression"))
         (if cls
           (static-method form *source* *line* cls (name sym) args)
-          (instance-method form *source* *line* obj (name sym) args))))))
+          (instance-member form *source* *line* obj (name sym) args))))))
 
 

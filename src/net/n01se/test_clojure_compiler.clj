@@ -15,8 +15,8 @@
   (:use clojure.contrib.test-is
         [net.n01se.clojure-compiler :only (analyze)]))
 
-(defmacro with-compiler-ns [& body]
-  `(binding [*ns* ~*ns*] ~@body))
+(defn ok-map [e t]
+  (every? identity (map (fn [[k v]] (= (t k) v)) e)))
 
 (deftest host-expr-types
   (is (= :static-method   (:type (analyze '(. System gc)))))
@@ -25,20 +25,28 @@
   (is (= :static-field    (:type (analyze '(. Integer MAX_VALUE)))))
   (is (= :static-field    (:type (analyze '(Integer/MAX_VALUE)))))
   (is (= :static-field    (:type (analyze 'Integer/MAX_VALUE))))
-  (is (= :instance-method (:type (analyze '(. 5 byteValue)))))
-  (is (= :instance-method (:type (analyze '(. 5 (equals 5))))))
-  (is (= :instance-method (:type (analyze '(. 5 (foo 5))))))
-  (is (= :instance-method (:type (analyze '(.equals 5 5)))))
-  (is (= :instance-method (:type (analyze '(.foo 5 5)))))
-  (is (= :instance-field  (:type (analyze '(. map foo)))))
-  (is (= :instance-field  (:type (analyze '(. 5 byteValue))))))
+  (is (ok-map {:allow-field false} (analyze '(. 5 byteValue))))
+  (is (ok-map {:allow-field false} (analyze '(. 5 (equals 5)))))
+  (is (ok-map {:allow-field false} (analyze '(. 5 (foo 5)))))
+  (is (ok-map {:allow-field false} (analyze '(.equals 5 5))))
+  (is (ok-map {:allow-field false} (analyze '(.foo 5 5))))
+  (is (ok-map {:allow-field true :members #{}} (analyze '(. map foo))))
+  (is (ok-map {:allow-field false} (analyze '(. 5 byteValue)))))
 
 
 (import '(java.io PushbackReader BufferedReader LineNumberReader)
         '(clojure.lang LineNumberingPushbackReader))
 
+(defmacro with-compiler-ns [& body]
+  `(binding [*ns* ~*ns*] ~@body))
+
+(defn target-classes [form]
+  (set (map #(.getDeclaringClass %)
+            (:members (with-compiler-ns
+                        (analyze form))))))
+
 (deftest auto-hint
+  (is (= #{Object}
+         (target-classes '(.equals 5 5))))
   (is (= #{BufferedReader LineNumberingPushbackReader}
-         (set (map #(.getDeclaringClass %)
-                   (:methods (with-compiler-ns
-                               (analyze '(.readLine map)))))))))
+         (target-classes '(.readLine map)))))
