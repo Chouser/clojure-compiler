@@ -274,7 +274,7 @@
 (defn macro? [op]
   (when-let [v (if (var? op) op (lookup-var op false))]
     (when (:macro ^v)
-      (if (and (= *ns* (namespace v)) (not (:private ^v)))
+      (if (and (= *ns* (.ns v)) (not (:private ^v)))
         v
         (throw (IllegalStateException. (str "Var is not public: " op)))))))
 
@@ -576,10 +576,10 @@
                           cs1 cs2))))
 
 
-(defn get-matching-params [mname target-expr arg-exprs minfos]
+(defn get-matching-params [mname arg-exprs minfos]
   ; cons target-expr type onto aclasses and :params:
   (let [jclass #(if (ast-has-java-class %) (ast-get-java-class %) Object)
-        aclasses (map jclass (cons target-expr arg-exprs))
+        aclasses (map jclass arg-exprs)
         match? (:arg-type-match *reflector*)
         either-match?  #(or (match? %1 %2) (match? %2 %1))
         matching-minfos (filter #(every? identity
@@ -599,7 +599,7 @@
                           matching-minfos))
                       matching-minfos)))))
 
-(defn instance-member [form source line obj mname args & [allow-field]]
+(defn instance-member [form obj mname args & [allow-field]]
   (let [minfos (for [c (vals (ns-imports *ns*))
                      m ((:get-methods *reflector*) c (count args) mname false)]
                  {:member m, :params (cons c (.getParameterTypes m))})
@@ -608,13 +608,15 @@
                        :let [m ((:get-field *reflector*) c mname false)]
                        :when m]
                    {:member m :params [c]}))
-        members (get-matching-params mname obj args (concat minfos finfos))
+        members (get-matching-params
+                  mname (cons obj args) (concat minfos finfos))
         this-type-known (ast-has-java-class obj)]
     (when (and *warn-on-reflection*
                (or (not this-type-known) (> (count members) 1)))
-      (.write *err*
-        (format "Reflection warning line: %d - call to %s%s, %d matches found"
-                line mname (if this-type-known "" " with untyped 'this'")
+      (.println *err*
+        (format "Reflection warning %s line %d: '%s'%s, %d matches"
+                *source* *line* mname
+                (if this-type-known "" " with untyped 'this'")
                 (count members))))
     (ast :instance-member form (when this-type-known
                                  (let [m (first members)]
@@ -625,12 +627,31 @@
      :allow-field (if this-type-known
                     (instance? Field (first members))
                     (boolean allow-field))
-     :members members)))
+     :target obj, :mname mname, :args args, :members members
+     :source *source*, :line *line*)))
 
-(defn static-method   [form source line cls mname args]
-  {:form form :cls cls :mname mname :args args :type :static-method})
-(defn static-field    [form source line cls fname]
-  {:form form :cls cls :fname fname :type :static-field})
+(defn static-method [form cls mname args]
+  (let [methods ((:get-methods *reflector*) cls (count args) mname true)]
+    (when (empty? methods)
+      (err-arg "No matching method: " mname))
+    ;(prn methods)
+    (let [members (get-matching-params
+                    mname args (for [m methods]
+                                 {:member m :params (vec (.getParameterTypes m))}))
+          rtns (set (map #(.getReturnType %) members))]
+      (when (and *warn-on-reflection* (not= 1 (count members)))
+        (.println *err*
+                  (format "Reflection warning %s line %d: '%s', %d matches"
+                          *source* *line* mname (count members))))
+      (ast :static-method form (when (seq rtns) (constantly (first rtns)))
+           :class cls, :mname mname, :args args, :members members
+           :source *source*, :line *line*))))
+
+(defn static-field [form cls fname]
+  (let [field (.getField cls fname)]
+    (ast :static-field form (constantly (.getType field))
+         :class cls, :mname fname
+         :source *source*, :line *line*)))
 
 (defmethod analyze-seq '. [[_ class-or-inst fld-meth-lst :as form]]
   (when (< (count form) 3)
@@ -643,16 +664,36 @@
       (let [fld-meth-name (name fld-meth-lst)]
         (if cls
           (if (seq ((:get-methods *reflector*) cls 0 fld-meth-name true))
-            (static-method form *source* *line* cls fld-meth-name [])
-            (static-field form *source* *line* cls fld-meth-name))
-          (instance-member form *source* *line* obj fld-meth-name [] :fld-ok)))
+            (static-method form cls fld-meth-name [])
+            (static-field form cls fld-meth-name))
+          (instance-member form obj fld-meth-name [] :fld-ok)))
       (let [[sym & arg-seq] (if (seq? fld-meth-lst) fld-meth-lst (nnext form))
             args (binding [*emit-context* (eval-or :expression)]
                    (into [] (map analyze arg-seq)))]
         (when-not (symbol? sym)
           (err-arg "Malformed member expression"))
         (if cls
-          (static-method form *source* *line* cls (name sym) args)
-          (instance-member form *source* *line* obj (name sym) args))))))
+          (static-method form cls (name sym) args)
+          (instance-member form obj (name sym) args))))))
 
+(defmethod analyze-seq 'def [[_ sym & [init] :as form]]
+  (when-not (<= 2 (count form) 3)
+    (err "def takes 1 or 2 argumenets, not " (count form)))
+  (when-not (symbol? sym)
+    (err "Second argument to def must be a Symbol"))
+  (let [v (lookup-var sym true)]
+    (when-not v
+      (err "Can't refer to qualified var that doesn't exist"))
+    (when-not (= *ns* (.ns v))
+      (if (namespace sym)
+        (err "Can't create defs outside of current ns")
+        (err "Name conflict, can't def " sym " because namespace: " *ns*
+             " refers to " v)))
+    (binding [*emit-context* (eval-or :expression)]
+      (ast :def form (constantly clojure.lang.Var)
+           :var v, :init (analyze init)
+           :meta (analyze (with-meta sym (assoc ^sym :line *line*
+                                                     :source *source*)))
+           :init-provided (== 3 (count form))
+           :source *source*, :line *line*))))
 

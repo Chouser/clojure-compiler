@@ -49,4 +49,6 @@
   (is (= #{Object}
          (target-classes '(.equals 5 5))))
   (is (= #{BufferedReader LineNumberingPushbackReader}
-         (target-classes '(.readLine map)))))
+         (target-classes '(.readLine map))))
+  (is (ok-map {:java-class Long/TYPE} (analyze '(Math/round 3.4))))
+         )
