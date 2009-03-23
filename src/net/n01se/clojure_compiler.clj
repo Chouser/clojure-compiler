@@ -132,7 +132,7 @@
 
 (defn ast-copy-java-class [o]
   (when (:has-java-class o)
-    (:java-class o)))
+    (constantly (:java-class o))))
 
 (defn maybe-primitive-type [e]
   (when (#{:local :instance-field :static-field :method} (:type e))
@@ -274,9 +274,9 @@
 (defn macro? [op]
   (when-let [v (if (var? op) op (lookup-var op false))]
     (when (:macro ^v)
-      (if (and (= *ns* (.ns v)) (not (:private ^v)))
-        v
-        (throw (IllegalStateException. (str "Var is not public: " op)))))))
+      (if (and (:private ^v) (not= *ns* (.ns v)))
+        (throw (IllegalStateException. (str "Var is not public: " op)))
+        v))))
 
 (declare analyze-seq)
 
@@ -297,7 +297,7 @@
   (ast :nil form (constantly nil) :val nil))
 
 (defmethod analyze Boolean [form]
-  (ast :boolean form (constantly Boolean) :val (if form RT/T RT/F)))
+  (ast :boolean form (constantly Boolean) :val (boolean form)))
 
 (defmethod analyze Symbol [sym]
   (let [tag (tag-of sym)
@@ -401,11 +401,14 @@
          :keys (binding [*emit-context* (eval-or :expression)]
                  (into [] (map analyze form))))))
 
-(defmethod analyze :default [form]
+(defn constant-ast [form]
   (let [c (class form)]
     (ast :constant form
          (when (Modifier/isPublic (.getModifiers c)) (constantly c))
          :val form :id (register-constant! form))))
+
+(defmethod analyze :default [form]
+  (constant-ast form))
 
 ; === analyze-seq ===
 
@@ -455,7 +458,8 @@
                :req-args lbs
                :rest-arg rest-lb
                :arg-locals (if rest-lb (conj lbs rest-lb) lbs)
-               :body (analyze (cons 'do body)))))))
+               :body (binding [*emit-context* :return]
+                       (analyze (cons 'do body))))))))
 
 ; (instance this-name? [Supers :as full.new.class.Name] [ctor-args]
 ;   (meth1 [] ...) ...)
@@ -586,6 +590,7 @@
                                           (map either-match?
                                                (:params %) aclasses))
                                  minfos)]
+    ; XXX isa?
     ; Now eliminate all methods that are subsumed by some other
     ; matching method, returning just the minimal set
     ;(doseq [m minfos] (prn (:params m)))
@@ -696,4 +701,76 @@
                                                      :source *source*)))
            :init-provided (== 3 (count form))
            :source *source*, :line *line*))))
+
+; (fn foo ([a] ....))
+; (fn [a] ....)
+; should be a regular macro, but this will do for now:
+(defmethod analyze-seq 'fn* [[special & args]]
+  (let [[this-name & etc] (if (symbol? (first args)) args (cons 'this args))
+        methods (if (seq? (first etc)) etc (list etc))
+        instance-body (map #(cons 'invoke %) methods)
+        instance-form `(~(with-meta 'instance ^special) ~this-name
+                           [clojure.lang.AFn] []
+                           ~@instance-body)]
+    (analyze instance-form)))
+
+(defmethod analyze-seq 'quote [[_ const :as form]]
+  (if (nil? const)
+    (ast :nil form (constantly nil) :val nil)
+    (constant-ast const)))
+
+(defmethod analyze-seq 'try [[_ & forms :as form]]
+  (if-not (= *emit-context* :return)
+    (analyze `(fn* [] ~form))
+    (let [ret-local (get-and-inc-local-num!)
+          finally-local (get-and-inc-local-num!)
+          parse-parts
+            (fn [parts clause]
+              (condp = (and (seq? clause) (first clause))
+                'catch (let [[_ cls lcl & catch-body] clause]
+                         (when (:final parts)
+                           (err "finally must be last in try form"))
+                         (or (symbol? lcl) (err-arg "Bad binding form: " lcl))
+                         (when (namespace lcl)
+                           (err "Can't bind qualified name: " lcl))
+                         (binding [*next-local-num* *next-local-num*
+                                   *in-catch-finally* true]
+                           (prn :cls cls :lcl lcl :body catch-body)
+                           (update-in
+                             parts [:catches] conj
+                             {:class (or (maybe-class cls false)
+                                         (err-arg "Unable to resolve "
+                                                  "classname: " cls))
+                              :local-binding (register-local!
+                                               lcl (and (symbol? cls) cls) nil)
+                              :handler (analyze (cons 'do catch-body))})))
+                'finally (do
+                           (when (:final parts)
+                             (err "only one finally allowed per try form"))
+                           (binding [*in-catch-finally* true]
+                             (assoc parts :final
+                                    (analyze (cons 'do (rest clause))))))
+                (do
+                  (when (:final parts)
+                    (err "finally must be last in try form"))
+                  (when (seq (:catches parts))
+                    (err "Only catch or finally clause can follow catch "
+                         "in try expression"))
+                  (update-in parts [:body] conj clause))))
+          {:keys [body catches final]}
+            (reduce parse-parts {:body [] :catches []} forms)
+          try-expr (analyze (cons 'do body))]
+      (ast :try form (ast-copy-java-class try-expr)
+           :try-expr try-expr, :catches catches, :finally final
+           :ret-local ret-local, :finally-local finally-local))))
+
+
+(defn testem []
+  (let [f (str "/home/chouser/proj/clojure-compiler/src/"
+               "net/n01se/clojure_compiler.clj")
+        r (java.io.PushbackReader. (java.io.FileReader. f))]
+    (doseq [form (repeatedly #(read r)) :while form]
+      (print "====: ")
+      (prn form)
+      (prn (binding [*ns* (the-ns 'testem)] (analyze form))))))
 
