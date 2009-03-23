@@ -247,7 +247,7 @@
       intern-new                       (.intern *ns* (Symbol/create (name sym)))
       *allow-unresolved-vars*          sym
       :else (and throw?
-                 (err "Unable to resolve symbol: " sym " in this context")))))
+                 (err "Unable to resolve symbol '" sym "' in this context")))))
 
 (defn resolve-sym
   ([sym] (resolve-in *ns* sym :quiet))
@@ -775,12 +775,17 @@
                              (ast-has-java-class else-ast)
                              (or (= (ast-get-java-class then-ast)
                                     (ast-get-java-class else-ast))
-                                 (nil? ast-get-java-class then-ast)
-                                 (nil? ast-get-java-class else-ast)))
+                                 (nil? (ast-get-java-class then-ast))
+                                 (nil? (ast-get-java-class else-ast))))
                     (if-let [cls (ast-get-java-class then-ast)]
                       (constantly cls)
                       (constantly (ast-get-java-class else-ast))))
          :source *source*,:line *line*)))
+
+(defmethod analyze-seq 'var [[_ sym :as form]]
+  (if-let [v (lookup-var sym false)]
+    (ast :the-var form (constantly Var))
+    (err "Unable to resolve var '" sym "' in this context")))
 
 (defn testem []
   (let [f (str "/home/chouser/proj/clojure-compiler/src/"
