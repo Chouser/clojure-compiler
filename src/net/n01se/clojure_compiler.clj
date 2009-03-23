@@ -764,6 +764,23 @@
            :try-expr try-expr, :catches catches, :finally final
            :ret-local ret-local, :finally-local finally-local))))
 
+(defmethod analyze-seq 'if* [[_ tst then else :as form]]
+  (when (< (count form) 3) (err "Too few arguments to if"))
+  (when (> (count form) 4) (err "Too many arguments to if"))
+  (let [tst-ast (binding [*emit-context* (eval-or :expression)]
+                  (analyze tst))
+        then-ast (analyze then)
+        else-ast (analyze else)]
+    (ast :if form (when (and (ast-has-java-class then-ast)
+                             (ast-has-java-class else-ast)
+                             (or (= (ast-get-java-class then-ast)
+                                    (ast-get-java-class else-ast))
+                                 (nil? ast-get-java-class then-ast)
+                                 (nil? ast-get-java-class else-ast)))
+                    (if-let [cls (ast-get-java-class then-ast)]
+                      (constantly cls)
+                      (constantly (ast-get-java-class else-ast))))
+         :source *source*,:line *line*)))
 
 (defn testem []
   (let [f (str "/home/chouser/proj/clojure-compiler/src/"
