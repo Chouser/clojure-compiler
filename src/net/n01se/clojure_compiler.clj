@@ -719,6 +719,10 @@
     (ast :nil form (constantly nil) :val nil)
     (constant-ast const)))
 
+(defmethod analyze-seq 'clojure.core/import* [form]
+    (ast :nil form (constantly nil) :val nil))
+
+
 (defmethod analyze-seq 'try [[_ & forms :as form]]
   (if-not (= *emit-context* :return)
     (analyze `(fn* [] ~form))
